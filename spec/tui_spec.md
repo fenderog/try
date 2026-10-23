@@ -228,6 +228,26 @@ Tokens are preserved intact - never split a `{b}...{/b}` pair.
 | Ctrl-W | Delete word before cursor (alphanumeric boundaries) |
 | Any printable | Insert at cursor, re-filter |
 
+## Graduated Projects
+
+Graduating a try (Ctrl-G) moves it out of the tries directory and leaves a
+symlink behind. Such entries — and, when `TRY_PROJECTS` is set, directories
+found directly in that directory that have no symlink in the tries directory
+(de-duplicated by realpath) — are **graduated projects**:
+
+- They are always listed **after** all ungraduated tries, regardless of score;
+  each group keeps its own fuzzy/recency ordering.
+- A non-selectable separator row (`── 🎓 Graduated (N) ──…`) sits between the
+  two groups; it is shown whenever at least one graduated entry matches the
+  current filter, and counts as one display row for scrolling.
+- Symlink-backed graduated entries keep the 🔗 icon; projects found directly
+  in `TRY_PROJECTS` use 🎓. Selecting either cds to its real path.
+- Ctrl-G on a graduated entry is a no-op ("Already graduated"); rename/delete
+  are unavailable for direct `TRY_PROJECTS` entries, which have no name inside
+  the tries directory.
+- When `TRY_PROJECTS` is unset, its default (the tries dir's parent) is *not*
+  scanned — only the graduation symlinks mark a folder as graduated.
+
 ## Scrolling
 
 - List scrolls to keep selection visible

@@ -1,6 +1,17 @@
 # try - fresh directories for every vibe
 
-**[Website](https://pages.tobi.lutke.com/try/)** · **[RubyGems](https://rubygems.org/gems/try-cli)** · **[GitHub](https://github.com/tobi/try)**
+> **Fork notice:** This is a fork of [tobi/try](https://github.com/tobi/try),
+> with one change: **graduated projects show up in the TUI, below your
+> active tries.** Graduating a try (`Ctrl-G`) used to leave it mixed into
+> the main list (marked only with a small 🔗, and able to outrank fresh
+> experiments). Here, ungraduated tries always come first, then a
+> `── 🎓 Graduated (N) ──` separator, then the graduated projects —
+> including projects found directly in `TRY_PROJECTS` whose symlink in the
+> tries dir was removed. See
+> [Graduated Projects Stay Findable](#-graduated-projects-stay-findable).
+> Everything else is unchanged from upstream.
+
+**[Website](https://pages.tobi.lutke.com/try/)** · **[RubyGems](https://rubygems.org/gems/try-cli)** · **[GitHub](https://github.com/tobi/try)** (upstream)
 
 *Your experiments deserve a home.* 🏠
 
@@ -100,6 +111,11 @@ Not just substring matching - it's smart:
 - Shows how long ago you touched each project
 - Recently accessed directories float to the top
 - Perfect for "what was I working on yesterday?"
+
+### 🎓 Graduated Projects Stay Findable
+- Press `Ctrl-G` to graduate a try to a real project (in `TRY_PROJECTS`, or the parent of your tries dir)
+- Graduated projects still show up in the selector — in their own `🎓 Graduated` section below your ungraduated tries, so active experiments stay on top
+- That includes projects whose symlink in the tries dir was removed, as long as `TRY_PROJECTS` is set
 
 ### 🎨 Pretty TUI
 - Clean, minimal interface

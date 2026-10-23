@@ -109,7 +109,7 @@ class TrySelector
   INPUT_CHAR_RE = /[a-zA-Z0-9\-\_\. ]/
   WORD_CHAR_RE = /[a-zA-Z0-9]/
 
-  def initialize(search_term = "", base_path: TRY_PATH, initial_input: nil, test_render_once: false, test_no_cls: false, test_keys: nil, test_confirm: nil)
+  def initialize(search_term = "", base_path: TRY_PATH, projects_path: nil, initial_input: nil, test_render_once: false, test_no_cls: false, test_keys: nil, test_confirm: nil)
     @search_term = search_term.gsub(/\s+/, '-')
     @cursor_pos = 0  # Navigation cursor (list position)
     @scroll_offset = 0
@@ -120,6 +120,10 @@ class TrySelector
     @selected = nil
     @all_trials = nil  # Memoized trials
     @base_path = base_path.to_s
+    # Graduate destination scanned for graduated projects (see load_all_tries).
+    # nil means "use TRY_PROJECTS"; the tries dir's parent is NOT scanned by
+    # default, since it is usually a general-purpose directory (e.g. ~/src).
+    @projects_path = projects_path.nil? ? TRY_PROJECTS : projects_path.to_s
     @delete_status = nil  # Status message for deletions
     @delete_mode = false  # Whether we're in deletion mode
     @marked_for_deletion = []  # Paths marked for deletion
@@ -197,11 +201,24 @@ class TrySelector
     end
   end
 
+  # Expanded TRY_PROJECTS directory, or nil when unset/empty (in which case
+  # graduated projects are found only via the symlinks left in the tries dir).
+  def projects_dir_path
+    return nil if @projects_path.nil? || @projects_path.empty?
+    File.expand_path(@projects_path)
+  end
+
   def load_all_tries
     # Load trials only once - single pass through directory
     @all_tries ||= begin
       tries = []
+      seen_realpaths = []
       now = Time.now
+      base_real = begin
+        File.realpath(@base_path)
+      rescue Errno::ENOENT, Errno::EACCES
+        File.expand_path(@base_path)
+      end
       Dir.foreach(@base_path.to_s) do |entry|
         # exclude . and .. but also .git, and any other hidden dirs.
         next if entry.start_with?('.')
@@ -209,7 +226,7 @@ class TrySelector
         path = File.join(@base_path, entry)
         begin
           stat = File.stat(path)
-        rescue Errno::ENOENT, Errno::EACCES
+        rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP
           next
         end
 
@@ -225,19 +242,81 @@ class TrySelector
         base_score += 2.0 if entry.match?(/^\d{4}-\d{2}-\d{2}-/)
 
         is_symlink = File.symlink?(path)
+        begin
+          real_path = is_symlink ? File.realpath(path) : path
+        rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP
+          next
+        end
+        seen_realpaths << real_path
+
+        # Graduating (Ctrl-G) moves a try out of the tries dir and leaves a
+        # symlink behind pointing at its new home. A symlink whose target
+        # lives outside the tries dir is therefore a graduated project, not
+        # an ordinary try; the list keeps it, but in its own section.
+        graduated = is_symlink && real_path != base_real && !real_path.start_with?(base_real + "/")
 
         tries << {
           text: entry,
           basename: entry,
-          path: is_symlink ? File.realpath(path) : path,
+          path: real_path,
           is_new: false,
           is_symlink: is_symlink,
+          graduated: graduated,
+          direct_project: false,
           ctime: stat.ctime,
           mtime: mtime,
           base_score: base_score
         }
       end
+      load_graduated_projects(tries, seen_realpaths, now, base_real)
       tries
+    end
+  end
+
+  # Also surface graduated projects that have no symlink left in the tries
+  # dir (e.g. the link was cleaned up, or the project was moved into
+  # TRY_PROJECTS by hand). Only an explicitly configured TRY_PROJECTS is
+  # scanned: the default graduate destination is the tries dir's parent,
+  # which is not a dedicated projects folder and must not be listed wholesale.
+  # Projects already reachable via a symlink are de-duplicated by realpath.
+  def load_graduated_projects(tries, seen_realpaths, now, base_real)
+    projects_dir = projects_dir_path
+    return if projects_dir.nil?
+    return if projects_dir == File.expand_path(@base_path)
+    return unless Dir.exist?(projects_dir)
+
+    Dir.foreach(projects_dir) do |entry|
+      next if entry.start_with?('.')
+
+      path = File.join(projects_dir, entry)
+      begin
+        stat = File.stat(path)
+        real_path = File.realpath(path)
+      rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP
+        next
+      end
+      next unless stat.directory?
+      next if real_path == base_real || real_path.start_with?(base_real + "/")
+      next if seen_realpaths.include?(real_path)
+      seen_realpaths << real_path
+
+      mtime = stat.mtime
+      hours_since_access = (now - mtime) / 3600.0
+      base_score = 3.0 / Math.sqrt(hours_since_access + 1)
+      base_score += 2.0 if entry.match?(/^\d{4}-\d{2}-\d{2}-/)
+
+      tries << {
+        text: entry,
+        basename: entry,
+        path: real_path,
+        is_new: false,
+        is_symlink: File.symlink?(path),
+        graduated: true,
+        direct_project: true,
+        ctime: stat.ctime,
+        mtime: mtime,
+        base_score: base_score
+      }
     end
   end
 
@@ -256,6 +335,8 @@ class TrySelector
     def path; data[:path]; end
     def is_new; data[:is_new]; end
     def is_symlink; data[:is_symlink]; end
+    def graduated; data[:graduated]; end
+    def direct_project; data[:direct_project]; end
     def ctime; data[:ctime]; end
     def mtime; data[:mtime]; end
     def base_score; data[:base_score]; end
@@ -272,12 +353,19 @@ class TrySelector
     end
 
     @last_query = @search.text
-    height = Tui::Terminal.size(STDERR)[0] || 24
-    max_results = [height - 6, 3].max
-    results = []
-    @fuzzy.match(@search.text).limit(max_results).each do |entry, positions, score|
-      results << TryEntry.new(entry, score, positions)
+    # No one-screen cap here: rendering windows the list, and capping the
+    # matches would make graduated entries (sorted last, below) unreachable
+    # whenever more than a screenful of tries match.
+    matched = []
+    @fuzzy.match(@search.text).each do |entry, positions, score|
+      matched << TryEntry.new(entry, score, positions)
     end
+    # Ungraduated tries first, graduated projects after; each group keeps
+    # the fuzzy/recency ordering from Fuzzy#match. render() inserts the
+    # visual separator between the two groups.
+    results = []
+    matched.each { |entry| results << entry unless entry.graduated }
+    matched.each { |entry| results << entry if entry.graduated }
     @cached_results = results
   end
 
@@ -321,7 +409,7 @@ class TrySelector
       when "\e[B", "\x0E"  # Down arrow or Ctrl-N
         @cursor_pos = [@cursor_pos + 1, total_items - 1].min
       when "\x04"  # Ctrl-D - toggle mark for deletion
-        if @cursor_pos < tries.length
+        if @cursor_pos < tries.length && !graduated_direct_guard(tries[@cursor_pos])
           path = tries[@cursor_pos].path
           if @marked_for_deletion.include?(path)
             @marked_for_deletion.delete(path)
@@ -336,14 +424,19 @@ class TrySelector
         handle_create_new
         break if @selected
       when "\x12"  # Ctrl-R - rename selected entry
-        if @cursor_pos < tries.length
+        if @cursor_pos < tries.length && !graduated_direct_guard(tries[@cursor_pos])
           run_rename_dialog(tries[@cursor_pos])
           break if @selected
         end
       when "\x07"  # Ctrl-G - graduate/ascend selected entry
         if @cursor_pos < tries.length
-          run_ascend_dialog(tries[@cursor_pos])
-          break if @selected
+          entry = tries[@cursor_pos]
+          if entry.graduated
+            @delete_status = "Already graduated: #{entry.basename}"
+          else
+            run_ascend_dialog(entry)
+            break if @selected
+          end
         end
       when "\x03", "\x1b"  # Ctrl-C or ESC
         if @delete_mode
@@ -467,29 +560,83 @@ class TrySelector
     footer_lines = screen.footer.lines.length
     max_visible = [height - header_lines - footer_lines, 3].max
     show_create_new = !@search.text.empty?
-    total_items = tries.length + (show_create_new ? 1 : 0)
 
-    if @cursor_pos < @scroll_offset
-      @scroll_offset = @cursor_pos
-    elsif @cursor_pos >= @scroll_offset + max_visible
-      @scroll_offset = @cursor_pos - max_visible + 1
+    # Display rows include non-selectable rows (the graduated separator and
+    # the blank line before "Create new"); @scroll_offset is a row offset,
+    # while @cursor_pos remains an index into tries (+ optional create row).
+    rows = build_display_rows(tries, show_create_new)
+    cursor_row = display_row_for_cursor(rows)
+
+    if cursor_row < @scroll_offset
+      @scroll_offset = cursor_row
+    elsif cursor_row >= @scroll_offset + max_visible
+      @scroll_offset = cursor_row - max_visible + 1
     end
+    max_offset = [rows.length - max_visible, 0].max
+    @scroll_offset = [[@scroll_offset, 0].max, max_offset].min
 
-    visible_end = [@scroll_offset + max_visible, total_items].min
-
-    (@scroll_offset...visible_end).each do |idx|
-      if idx == tries.length && !tries.empty? && idx >= @scroll_offset
+    visible_rows = rows[@scroll_offset, max_visible] || []
+    visible_rows.each do |kind, idx, count|
+      case kind
+      when :separator
+        render_separator_line(screen, count)
+      when :spacer
         screen.body.add_line
-      end
-
-      if idx < tries.length
+      when :entry
         render_entry_line(screen, tries[idx], idx == @cursor_pos, width)
-      else
+      when :create
         render_create_line(screen, idx == @cursor_pos, width)
       end
     end
 
     screen.flush
+  end
+
+  # Flatten tries (+ optional create row) into display rows:
+  # [:entry, tries_index, nil], [:separator, nil, graduated_count],
+  # [:spacer, nil, nil], [:create, tries.length, nil].
+  # get_tries guarantees graduated entries are contiguous at the end, so a
+  # single separator is inserted before the first of them.
+  def build_display_rows(tries, show_create_new)
+    graduated_count = 0
+    tries.each { |entry| graduated_count += 1 if entry.graduated }
+
+    rows = []
+    tries.each_with_index do |entry, idx|
+      rows << [:separator, nil, graduated_count] if entry.graduated && (idx == 0 || !tries[idx - 1].graduated)
+      rows << [:entry, idx, nil]
+    end
+    if show_create_new
+      rows << [:spacer, nil, nil] unless tries.empty?
+      rows << [:create, tries.length, nil]
+    end
+    rows
+  end
+
+  def display_row_for_cursor(rows)
+    rows.each_with_index do |row, i|
+      kind, idx, _count = row
+      return i if (kind == :entry || kind == :create) && idx == @cursor_pos
+    end
+    0
+  end
+
+  def render_separator_line(screen, graduated_count)
+    line = screen.body.add_line
+    line.write.write_dim("  ── ")
+    line.write.write(Tui::Text.accent("🎓 Graduated"))
+    line.write.write_dim(" (#{graduated_count}) ")
+    line.write.write_dim(fill("─"))
+  end
+
+  # Graduated projects found directly in TRY_PROJECTS have no entry inside
+  # the tries dir, so rename/delete (which operate on tries-dir names and
+  # validate paths against it) cannot act on them. Symlink-backed graduated
+  # entries keep the legacy behaviour. Returns true when the key was handled.
+  def graduated_direct_guard(entry)
+    return false unless entry && entry.direct_project
+    @delete_status = "🎓 Graduated project — Enter to open; rename/delete unavailable"
+    true
   end
 
   def render_entry_line(screen, entry, is_selected, width)
@@ -505,6 +652,8 @@ class TrySelector
     line.write.write((is_selected ? Tui::Text.highlight("→ ") + selected_foreground : "  "))
     icon = if is_marked
       emoji("🗑️")
+    elsif entry.direct_project
+      emoji("🎓")
     elsif entry.is_symlink
       emoji("🔗")
     else

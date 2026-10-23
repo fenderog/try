@@ -28,7 +28,9 @@ class TrySelectorTestCase < Minitest::Test
   end
 
   def build_selector(**opts)
-    TrySelector.new("", base_path: @tmpdir, test_render_once: true, test_no_cls: true, **opts)
+    # projects_path: "" keeps tests hermetic (no scanning of a real
+    # TRY_PROJECTS from the environment) unless a test overrides it.
+    TrySelector.new("", base_path: @tmpdir, projects_path: "", test_render_once: true, test_no_cls: true, **opts)
   end
 end
 
@@ -456,6 +458,88 @@ class SetupTerminalWinchGuardTest < TrySelectorTestCase
     end
     # Guard skipped the trap, so no handler was captured.
     assert_nil sel.instance_variable_get(:@old_winch_handler)
+  end
+end
+
+# -------------------------------------------------------------------
+# Graduated entries: listed after ungraduated tries, visually separated
+# -------------------------------------------------------------------
+class GraduatedEntriesTest < TrySelectorTestCase
+  def with_projects_dir
+    Dir.mktmpdir("try_projects") { |dir| yield dir }
+  end
+
+  def test_symlink_to_outside_dir_is_graduated_and_sorted_last
+    with_projects_dir do |projects|
+      target = File.join(projects, "graduated-proj")
+      FileUtils.mkdir_p(target)
+      FileUtils.mkdir_p(File.join(@tmpdir, "2025-01-01-fresh-try"))
+      File.symlink(target, File.join(@tmpdir, "2025-06-01-old-try"))
+      # Graduated entry is the most recent (highest score) on purpose:
+      # grouping, not score, must put it below ungraduated tries.
+      old = Time.now - 365 * 86_400
+      File.utime(old, old, File.join(@tmpdir, "2025-01-01-fresh-try"))
+
+      tries = build_selector.send(:get_tries)
+      assert_equal ["2025-01-01-fresh-try", "2025-06-01-old-try"], tries.map(&:basename)
+      refute tries.first.graduated
+      assert tries.last.graduated
+      refute tries.last.direct_project
+      assert_equal File.realpath(target), tries.last.path
+    end
+  end
+
+  def test_symlink_within_tries_is_not_graduated
+    FileUtils.mkdir_p(File.join(@tmpdir, "real-try"))
+    File.symlink(File.join(@tmpdir, "real-try"), File.join(@tmpdir, "alias-try"))
+    tries = build_selector.send(:get_tries)
+    alias_entry = tries.find { |t| t.basename == "alias-try" }
+    assert alias_entry
+    refute alias_entry.graduated
+  end
+
+  def test_projects_dir_scanned_and_deduped_against_symlinks
+    with_projects_dir do |projects|
+      FileUtils.mkdir_p(File.join(projects, "linked-proj"))
+      FileUtils.mkdir_p(File.join(projects, "loose-proj"))
+      FileUtils.mkdir_p(File.join(@tmpdir, "2025-01-01-fresh-try"))
+      File.symlink(File.join(projects, "linked-proj"), File.join(@tmpdir, "2025-06-01-linked"))
+
+      sel = build_selector(projects_path: projects)
+      tries = sel.send(:get_tries)
+      graduated = tries.select(&:graduated)
+      # linked-proj appears once (via its symlink), loose-proj once (direct).
+      assert_equal ["2025-06-01-linked", "loose-proj"], graduated.map(&:basename)
+      loose = graduated.find { |t| t.basename == "loose-proj" }
+      assert loose.direct_project
+      assert_equal File.realpath(File.join(projects, "loose-proj")), loose.path
+      # Ungraduated still first.
+      assert_equal "2025-01-01-fresh-try", tries.first.basename
+    end
+  end
+
+  def test_no_projects_scan_when_unset
+    with_projects_dir do |projects|
+      FileUtils.mkdir_p(File.join(projects, "loose-proj"))
+      FileUtils.mkdir_p(File.join(@tmpdir, "2025-01-01-fresh-try"))
+      sel = build_selector(projects_path: "")
+      assert_equal ["2025-01-01-fresh-try"], sel.send(:get_tries).map(&:basename)
+    end
+  end
+
+  def test_display_rows_insert_single_separator_before_graduated
+    with_projects_dir do |projects|
+      target = File.join(projects, "graduated-proj")
+      FileUtils.mkdir_p(target)
+      FileUtils.mkdir_p(File.join(@tmpdir, "2025-01-01-fresh-try"))
+      File.symlink(target, File.join(@tmpdir, "2025-06-01-old-try"))
+
+      sel = build_selector
+      rows = sel.send(:build_display_rows, sel.send(:get_tries), false)
+      kinds = rows.map(&:first)
+      assert_equal [:entry, :separator, :entry], kinds
+      assert_equal 1, rows[1][2] # graduated count on the separator row
+    end
   end
 end
 
